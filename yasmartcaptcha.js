@@ -1,5 +1,5 @@
 ﻿/*!
- * YaSmartCaptcha v1.0.0
+ * YaSmartCaptcha v1.0.1
  *
  * @author Serge Galich <gaserge@mail.ru>
  * @copyright 2026
@@ -22,7 +22,7 @@
 
     const Module = {
         name: LIB_NAME,
-        version: '1.0.3',
+        version: '1.0.1',
         _debug: false,
         _initOnce: false,
 
@@ -31,14 +31,17 @@
             siteKey: '',
             lazyPreload: true,
             selector: `data-${DATA_PREFIX}`,
-            tokenInput: 'smart-token'
+            tokenInput: 'smart-token',
+            loader: true,
+            disableButton: true,
+            autoBind: false  
         },
 
         _captchaLoaded: false,
         _captchaLoading: null,
 
-        // Хранилище обработчиков для форм (WeakMap)
         _formHandlers: new WeakMap(),
+        _autoBindObserver: null,
 
         _getDataAttrName: function(name) {
             return `data-${DATA_PREFIX}-${name}`;
@@ -107,11 +110,37 @@
         initOnce: function(params = {}) {
             if (this._initOnce) return;
             this._initOnce = true;
+
+            if (this._config.enabled && this._config.lazyPreload) {
+                this.bindInputs();
+            }
+
+            if (this._config.enabled && this._config.autoBind) {
+                this.autoBindForms();
+            }
         },
 
         init: function(quInstance, params = {}) {
             this.config(params);
             this.initOnce();
+        },
+
+        bindInputs: function() {
+            const _this = this;
+        
+            if (!this._config.enabled || !this._config.siteKey) {
+                this.debug(`⚠️ [${LIB_NAME}] not enabled or siteKey missing`);
+                return;
+            }
+        
+            this._Qu.on('input focusin',
+                `form[${this._config.selector}] input, form[${this._config.selector}] textarea, form[${this._config.selector}] select`,
+                function() {
+                    _this._lazyLoad();
+                }
+            );
+        
+            this.debug(`⚙️ [${LIB_NAME}] Lazy binded to inputs`);
         },
 
         /**
@@ -237,6 +266,46 @@
             this.debug('✅ Token added to form');
         },
 
+        autoBindForms: function() {
+            const _this = this;
+            const selector = this._config.selector;
+            const query = 'form[' + selector + ']';
+        
+            // функция, которая биндит одну форму
+            function bindOne(form) {
+                if (form._captchaAutoBound) return;    // уже биндили — пропускаем
+                form._captchaAutoBound = true;
+                _this.bindForm(form, { action: 'submit' });   // ← ВОТ СЮДА твой bindForm
+            }
+        
+            // 1) сразу биндим то, что уже есть на странице
+            document.querySelectorAll(query).forEach(bindOne);
+        
+            // 2) следим за новыми формами
+            this._autoBindObserver = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    m.addedNodes.forEach(function(node) {
+                        if (node.nodeType !== 1) return;   // не элемент — пропуск
+        
+                        // сам node — форма?
+                        if (node.matches && node.matches(query)) {
+                            bindOne(node);
+                        }
+        
+                        // внутри node есть формы?
+                        if (node.querySelectorAll) {
+                            node.querySelectorAll(query).forEach(bindOne);
+                        }
+                    });
+                });
+            });
+        
+            this._autoBindObserver.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+        },
+
         /**
          * Привязка невидимой капчи к форме
          * Перехватывает submit, получает токен, добавляет скрытое поле и отправляет форму
@@ -246,115 +315,76 @@
                 this.debug('⚠️ Not enabled or siteKey missing');
                 return;
             }
-
+        
             const _this = this;
+            const action = options.action || 'submit';
 
-            // Удаляем старый обработчик, если он уже был привязан к этой форме
+            const useLoader     = options.loader        !== undefined ? !!options.loader        : _this._config.loader;
+            const useDisable    = options.disableButton !== undefined ? !!options.disableButton : _this._config.disableButton;
+        
             if (this._formHandlers.has(form)) {
-                const oldHandler = this._formHandlers.get(form);
-                this._Qu.off('submit', form, oldHandler);
+                const old = this._formHandlers.get(form);
+                form.removeEventListener('submit', old);
                 this._formHandlers.delete(form);
             }
-
+        
             const handler = async function(e) {
+                if (form._captchaPassed) {
+                    form._captchaPassed = false;
+
+                    if (useDisable) {
+                        const btn = form.querySelector('[type="submit"]');
+                        if (btn) btn.disabled = false;
+                    }
+                    if (useLoader) {
+                        _this._Qu.loading(false, form);
+                    }
+                    return;
+                }
+        
                 e.preventDefault();
 
-                const submitBtn = form.querySelector('[type="submit"]') || form.querySelector('button');
-                if (submitBtn) submitBtn.disabled = true;
-                if (options.loader) _this._Qu.loading(true, form);
-
+                if (useDisable) {
+                    const btn = form.querySelector('[type="submit"]');
+                    if (btn) btn.disabled = true;
+                }
+                if (useLoader) {
+                    _this._Qu.loading(true, form);
+                }
+        
                 try {
-                    await _this.ensureLoaded();
-
-                    // Контейнер для виджета (невидимый)
-                    let container = form.querySelector('.js-smartcaptcha-container');
-                    if (!container) {
-                        container = document.createElement('div');
-                        container.className = 'js-smartcaptcha-container';
-                        container.style.display = 'none';
-                        form.appendChild(container);
-                    }
-
-                    let widgetId = container.getAttribute('data-widget-id');
-                    if (!widgetId) {
-                        // Создаём виджет, оборачивая в промис для обработки ошибок
-                        widgetId = await new Promise((resolveWidget, rejectWidget) => {
-                            const id = window.smartCaptcha.render(container, {
-                                sitekey: _this._config.siteKey,
-                                invisible: true,
-                                callback: () => {
-                                    // Этот callback будет вызван после успешного получения токена
-                                    // через execute, но мы обработаем токен ниже
-                                },
-                                'error-callback': (error) => {
-                                    rejectWidget(error);
-                                }
-                            });
-                            container.setAttribute('data-widget-id', id);
-                            resolveWidget(id);
-                        });
-                    } else {
-                        widgetId = parseInt(widgetId);
-                    }
-
-                    // Получаем токен с таймаутом
-                    const token = await new Promise((resolveToken, rejectToken) => {
-                        const timeoutId = setTimeout(() => {
-                            rejectToken(new Error('SmartCaptcha execution timeout'));
-                        }, 30000);
-
-                        // Запоминаем колбэк для выполнения
-                        const originalCallback = window.smartCaptcha._callbacks?.[widgetId];
-                        // Используем хитрость: при execute вызывается callback из render
-                        // Можно передать свой callback через параметр, но проще сохранить в глобальный объект
-                        // Используем существующий механизм: после execute сработает callback из render,
-                        // но нам нужно перехватить токен. Можно использовать промежуточный обработчик.
-                        // Вместо этого мы создадим временный слушатель на событие?
-                        // Лучше использовать подход с _widgetResolveMap (если он ещё есть)
-                        // Для упрощения добавим временный обработчик в _widgetResolveMap (если он определён)
-                        if (!_this._widgetResolveMap) _this._widgetResolveMap = {};
-                        _this._widgetResolveMap[widgetId] = (token) => {
-                            clearTimeout(timeoutId);
-                            resolveToken(token);
-                        };
-                        try {
-                            window.smartCaptcha.execute(widgetId);
-                        } catch (e) {
-                            clearTimeout(timeoutId);
-                            delete _this._widgetResolveMap[widgetId];
-                            rejectToken(e);
-                        }
-                    });
-
-                    _this.debug('✅ Token obtained:', token);
-
-                    // Добавляем токен в форму как скрытое поле
-                    const tokenInputName = _this._config.tokenInput || 'smart-token';
-                    let tokenInput = form.querySelector(`input[name="${tokenInputName}"]`);
-                    if (!tokenInput) {
-                        tokenInput = document.createElement('input');
-                        tokenInput.type = 'hidden';
-                        tokenInput.name = tokenInputName;
-                        form.appendChild(tokenInput);
-                    }
-                    tokenInput.value = token;
-
-                    if (options.onSubmit) {
+                    const token = await _this.check(action);
+                    _this.addTokenToForm(form, token);
+        
+                    if (typeof options.onSubmit === 'function') {
                         options.onSubmit(form);
+                        return;
+                    }
+        
+                    form._captchaPassed = true;
+        
+                    if (typeof form.requestSubmit === 'function') {
+                        form.requestSubmit();
                     } else {
                         form.submit();
                     }
                 } catch (error) {
-                    console.error(`❌ [${LIB_NAME}] Form submission failed`, error);
-                    if (submitBtn) submitBtn.disabled = false;
-                    if (options.loader) _this._Qu.loading(false, form);
-                    if (options.onError) options.onError(error);
+                    console.error(`❌ [${LIB_NAME}] bindForm failed`, error);
+                    if (useDisable) {
+                        const btn = form.querySelector('[type="submit"]');
+                        if (btn) btn.disabled = false;
+                    }
+                    if (useLoader) {
+                        _this._Qu.loading(false, form);
+                    }
+                    if (typeof options.onError === 'function') options.onError(error);
                 }
             };
-
+        
             this._formHandlers.set(form, handler);
-            this._Qu.on('submit', form, handler);
-            this.debug(`🔗 Form bound to SmartCaptcha`);
+            form.addEventListener('submit', handler);
+        
+            this.debug(`🔗 [${LIB_NAME}] Form bound: action=${action}`);
         },
 
         /**
