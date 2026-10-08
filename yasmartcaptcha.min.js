@@ -1,4 +1,4 @@
-﻿/*!
+/*!
  * YaSmartCaptcha v1.0.1
  *
  * @author Serge Galich <gaserge@mail.ru>
